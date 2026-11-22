@@ -265,6 +265,8 @@ def _aspire_client(monkeypatch, calls):
         def __getattr__(self, name):
             def call(*a, **k):
                 calls.append((name, a, k))
+                if name == "aspire_task_events":
+                    return []
                 return {"name": name, "args": a}
             return call
     monkeypatch.setattr(server, "NoriClient", Fake)
@@ -282,7 +284,8 @@ def test_aspire_proxy_forwards_the_jwt_and_the_bodies(client: TestClient, monkey
         assert ("aspire_start_task", ({"robot": "NORI-A3-0003", "instruction": "pick up the can",
                                        "constraints": {"operator_presence": True}},), {}) in calls
         assert ("jwt", "jwt-1") in calls
-        assert c.get("/nori/aspire/tasks/t1/events?since=4", headers=h).json()["args"] == ["t1", 4]
+        assert c.get("/nori/aspire/tasks/t1/events?since=4", headers=h).json() == []
+        assert ("aspire_task_events", ("t1", 4), {}) in calls
         assert c.post("/nori/aspire/tasks/t1/cancel", json={"reason": "E-STOP"}, headers=h).status_code == 202
         assert ("aspire_cancel", ("t1", "E-STOP"), {}) in calls
         assert c.post("/nori/aspire/tasks/t1/presence", headers=h).json()["name"] == "aspire_presence"
@@ -293,3 +296,23 @@ def test_aspire_proxy_forwards_the_jwt_and_the_bodies(client: TestClient, monkey
         assert c.get("/nori/aspire/robots/NORI-A3-0003/notes", headers=h).json()["name"] == "aspire_robot_notes"
         r = c.post("/nori/aspire/robots/NORI-A3-0003/notes/entries/reach/Right%20arm%20inward%20edge", json={"action": "edit", "field": "what", "text": "x"}, headers=h)
         assert r.json()["args"] == ["NORI-A3-0003", "reach", "Right arm inward edge", {"action": "edit", "field": "what", "text": "x"}]
+
+
+def test_local_aspire_poll_saves_a_kept_episode(client, monkeypatch, tmp_lerobot_home):
+    import json
+
+    from lelab.server import NoriClient
+
+    events = [
+        {"n": 1, "type": "episode_started", "ts": 10, "episode": "take"},
+        {"n": 2, "type": "step_start", "ts": 11, "tool": "lift"},
+        {"n": 3, "type": "step", "ts": 12, "tool": "lift"},
+        {"n": 4, "type": "episode_done", "ts": 15, "episode": "take", "keep": True},
+    ]
+    monkeypatch.setattr(NoriClient, "aspire_task_events",
+                        lambda self, task_id, since: [e for e in events if e["n"] >= since])
+    response = client.get("/nori/aspire/tasks/task1/events?since=4", headers={"X-Nori-JWT": "jwt-1"})
+    assert response.json() == events[-1:]
+    saved = json.loads((tmp_lerobot_home / "agent_episodes/task1/take.json").read_text())
+    assert saved["calls"] == [{"tool": "lift", "args": {}, "start_unix_s": 11, "end_unix_s": 12,
+                               "status": None}]

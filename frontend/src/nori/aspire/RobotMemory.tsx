@@ -3,9 +3,9 @@
 // aspire_robot_notes (migration 059). Read-only text plus three actions per entry: retract (it leaves the next
 // task's prompt; its text goes to the changelog), edit one field, promote (marked; the entry comes back as SKILL.md
 // text to paste into the library). Lives under the Agent page's transcript; refreshes after each run's `advice` event.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import type { AspireApi, EntryAction, NoteFile, RobotNotes } from "./api";
+import type { AspireApi, EntryAction, NoteFile, RecoverySkill, RobotNotes } from "./api";
 
 export interface MemoryEntry {
   topic: string;
@@ -66,7 +66,9 @@ export function parseContext(files: NoteFile[]): { key: string; value: string; n
   return out;
 }
 
-export const RobotMemory = ({ api, robot, refreshKey }: { api: AspireApi; robot: string; refreshKey: number }) => {
+export const RobotMemory = ({ api, robot, refreshKey, onSelectTrial, canSelect }: {
+  api: AspireApi; robot: string; refreshKey: number; onSelectTrial: (skill: RecoverySkill) => void; canSelect: boolean;
+}) => {
   const [notes, setNotes] = useState<RobotNotes | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
@@ -75,12 +77,18 @@ export const RobotMemory = ({ api, robot, refreshKey }: { api: AspireApi; robot:
   const [promotedText, setPromotedText] = useState<{ title: string; text: string } | null>(null);
   const [showLog, setShowLog] = useState(false);
 
+  const requestVersion = useRef(0);
   const load = useCallback(async () => {
+    const version = ++requestVersion.current;
     if (!robot) { setNotes(null); return; }
-    try { setNotes(await api.notes(robot)); setError(null); }
-    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    try {
+      const latest = await api.notes(robot);
+      if (requestVersion.current === version) { setNotes(latest); setError(null); }
+    } catch (e) {
+      if (requestVersion.current === version) setError(e instanceof Error ? e.message : String(e));
+    }
   }, [api, robot]);
-  useEffect(() => { void load(); }, [load, refreshKey]);
+  useEffect(() => { void load(); return () => { requestVersion.current++; }; }, [load, refreshKey]);
 
   const entries = useMemo(() => (notes ? parseEntries(notes.files) : []), [notes]);
   const context = useMemo(() => (notes ? parseContext(notes.files) : []), [notes]);
@@ -102,6 +110,53 @@ export const RobotMemory = ({ api, robot, refreshKey }: { api: AspireApi; robot:
   const copy = (text: string) => {
     try { void navigator.clipboard.writeText(text); } catch { /* the textarea below stays selectable */ }
   };
+
+  if (notes?.robot === robot && notes.experiment) {
+    const { folder, skills } = notes.experiment;
+    const pending = skills.filter((s) => !s.verification);
+    const verified = skills.filter((s) => s.verification);
+    return (
+      <section className="rounded-md border border-nori-h14131a/10 bg-nori-hf3f1e8 text-xs text-nori-h5a5346">
+        <button type="button" aria-expanded={open} onClick={() => setOpen(!open)}
+          className="flex w-full items-center justify-between px-3 py-2 text-left font-mono text-[11px]">
+          <span className="uppercase tracking-[0.18em] text-nori-hb06a1c">// learning · local</span>
+          <span>{pending.length} waiting · {verified.length} verified {open ? "▾" : "▸"}</span>
+        </button>
+        {open && <div className="space-y-3 border-t border-nori-h14131a/10 px-3 py-2">
+          <div className="break-all font-mono text-[11px]">{folder} · {robot}</div>
+          {[{ label: "Waiting for verification", items: pending }, { label: "Verified skills", items: verified }].map(({ label, items }) => (
+            <div key={label}>
+              <h3 className="font-semibold text-nori-h14131a">{label} ({items.length})</h3>
+              {items.length === 0 && <p className="text-muted-foreground">None yet.</p>}
+              {items.map((s) => <article key={s.id} className="mt-1 space-y-1 rounded border border-nori-h14131a/10 p-2">
+                <strong>{s.title}</strong>
+                <p><b>When </b>{s.trigger}</p><p><b>Correction </b>{s.correction}</p>
+                {s.limits && <p><b>Limits </b>{s.limits}</p>}
+                {s.check && <p><b>Check </b>{s.check}</p>}
+                {s.scene && <p><b>Original setup </b>{s.scene}</p>}
+                <p>{s.evidence}</p>
+                <p className="font-mono text-[10px]">{s.task} · failed #{s.failed_step} · fix #{s.correction_step} · checked #{s.evidence_step}</p>
+                {s.examples?.filter(ex => ex.task !== s.verification?.task || ex.evidence_step !== s.verification?.evidence_step).map(ex =>
+                  <div key={`${ex.task}-${ex.failed_step}`}>
+                    <p><b>Supporting recovery </b>{ex.evidence}</p>
+                    <p className="font-mono text-[10px]">{ex.task} · failed #{ex.failed_step} · fix #{ex.correction_step} · checked #{ex.evidence_step}</p>
+                  </div>)}
+                {s.verification ? <>
+                  <p>{s.verification.evidence}</p>
+                  {s.verification.variation && <p><b>Transfer </b>{s.verification.variation.before} → {s.verification.variation.after} · observed at #{s.verification.variation.step}</p>}
+                  <p className="font-mono text-[10px]">Verified in {s.verification.task} · checked #{s.verification.evidence_step}</p>
+                </> : <>
+                  <p><b>Transfer test </b>{s.transfer_test ?? "Vary the object, placement or scene and check that the recovery still works."}</p>
+                  <Button size="sm" variant="outline" disabled={!canSelect} onClick={() => onSelectTrial(s)}>Set up verification run</Button>
+                </>}
+              </article>)}
+            </div>
+          ))}
+          {error && <p role="alert">{error}</p>}
+        </div>}
+      </section>
+    );
+  }
 
   const summary = !robot ? "pair a robot to see its memory"
     : !notes ? (error ? `unavailable — ${error}` : "loading…")

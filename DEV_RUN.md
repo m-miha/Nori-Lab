@@ -141,3 +141,46 @@ it in a relaunch loop if you want reconnect-friendly behavior.
   Join. Robot audio is intentionally muted until you Join.
 - **Auth fails / can't sign in:** the laptop `.env` is missing `SUPABASE_URL` /
   `SUPABASE_ANON_KEY`, so `/nori/config` can't configure Supabase.
+
+## Run the Agent with an empty local skill library
+
+From the Nori-Lab checkout, with the usual Lab dependencies and Node available, run:
+
+```bash
+scripts/local-agent --hardware "$HOME/.local/share/nori/skill-trials/first"
+```
+
+The launcher starts the local Agent worker and the Lab dev UI at `http://localhost:8080`.
+Account, pairing, and billing requests use the hosted Nori backend. Set `NORI_BACKEND_URL`
+in the launch environment to use a separate backend for those requests.
+It uses the sibling `../nori-policy-agent` checkout (including its `run_task(context_factory=...)`
+extension) and its `sim/.venv-mujoco` environment. Override these with
+`NORI_POLICY_AGENT_DIR` and `NORI_POLICY_PYTHON` if needed. It reads the SDK login,
+provider key and depth-service credentials from `~/.config/nori/sdk.env` or the path
+in `NORI_SDK_ENV`. Omit `--hardware` to inspect the UI without enabling robot motion.
+
+On NORI-A3-0003, the local Agent uses stereo triangulation from the front and
+overhead RGB cameras. Leave **table height (m)** blank to measure the tabletop
+before homing. Both cameras need to see textured areas of the tabletop and the
+target. Wrist cameras provide RGB for visual checks.
+
+1. Select your paired robot and open **Agent → Learning**. Check the local folder and the two counts.
+   A new folder starts empty. Reusing a folder restores that robot’s pending and verified skills.
+2. Enable **learn from this run** and **stop if I close this page**, enter the goal and start.
+   The transcript numbers each primitive. When the agent detects a failed action, it cites the
+   failed call and the observation that revealed it. It continues the task. After a correction
+   and a later outcome check, it can submit the recovery. A separate model call reviews the
+   recorded calls and available images. The reviewer writes the reusable decision, its limits,
+   an outcome check, and a transfer test. A matching recovery from another run adds evidence to
+   the existing skill. The Learning tab links each example to its original call numbers.
+3. Under **Learning → Waiting for verification**, select **Set up verification run**. Follow the
+   suggested transfer test by varying the object, its placement, or a relevant scene condition.
+   Start the task and let the trigger recur. Verification requires evidence that the agent
+   applied the decision successfully in the changed setup. An evidenced repeat in the same
+   setup adds a supporting example and leaves the candidate pending.
+   Subsequent tasks on that robot receive the verified procedures. Pending skills are shown
+   to the agent only for their selected verification run.
+
+The selected folder holds `recovery-skills.sqlite3`. Trial records survive worker restarts.
+The live task transcript lasts for the worker session. Stop the launcher and start Lab normally
+to return to the hosted Agent and its usual memory.

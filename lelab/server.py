@@ -38,6 +38,7 @@ from starlette.responses import Response
 from starlette.types import Scope
 
 from . import datasets as dataset_browser
+from .agent_episode import save_kept_timelines
 
 # Import our custom calibration functionality
 from .calibrate import CalibrationRequest, calibration_manager
@@ -2002,48 +2003,82 @@ class NoriAspireCancelBody(BaseModel):
     reason: str = ""
 
 
+def _aspire_client(request: Request, *, local: bool | None = None) -> NoriClient:
+    if local is None:
+        local = bool(os.environ.get("NORI_LAB_SKILL_DIR"))
+    if not local:
+        return _nori_client(request)
+    try:
+        connection = json.loads(Path(os.environ["NORI_LAB_WORKER_CONNECTION"]).read_text())
+        return NoriClient(jwt=connection["token"], base_url=f"http://127.0.0.1:{int(connection['port'])}")
+    except (KeyError, OSError, ValueError) as exc:
+        raise HTTPException(503, "Local skill worker unavailable. Start Lab with scripts/local-agent.") from exc
+
+
+def _aspire_task_client(request: Request, handle: str) -> tuple[NoriClient, str]:
+    local = handle.startswith("local-")
+    return _aspire_client(request, local=local), handle.removeprefix("local-")
+
+
 @app.post("/nori/aspire/tasks", status_code=202)
 def nori_aspire_start(body: NoriAspireStartBody, request: Request):
-    """Queue an ASPIRE task on a paired robot; the hosted worker runs it."""
-    client = _nori_client(request)
-    return _nori_proxy(lambda: client.aspire_start_task(body.model_dump(exclude_none=True)))
+    """Local experimental tasks carry a distinct handle so existing hosted tasks stay reachable."""
+    local = bool(os.environ.get("NORI_LAB_SKILL_DIR")) and (body.caller or {}).get("kind") == "lab_agent_page"
+    if (body.constraints or {}).get("verify_skill") and not local:
+        raise HTTPException(409, "Start the local skill worker to verify a local skill.")
+    client = _aspire_client(request, local=local)
+    try:
+        result = _nori_proxy(lambda: client.aspire_start_task(body.model_dump(exclude_none=True)))
+    except HTTPException as exc:
+        if local and exc.status_code == 409 and isinstance(exc.detail, dict) and exc.detail.get("running"):
+            exc.detail = dict(exc.detail, running="local-" + exc.detail["running"])
+        raise
+    return dict(result, task_id="local-" + result["task_id"]) if local else result
 
 
 @app.get("/nori/aspire/tasks/{task_id}")
 def nori_aspire_task(task_id: str, request: Request):
-    client = _nori_client(request)
-    return _nori_proxy(lambda: client.aspire_get_task(task_id))
+    handle = task_id
+    client, task_id = _aspire_task_client(request, task_id)
+    record = _nori_proxy(lambda: client.aspire_get_task(task_id))
+    return dict(record, task_id=handle) if handle != task_id else record
 
 
 @app.get("/nori/aspire/tasks/{task_id}/events")
 def nori_aspire_events(task_id: str, request: Request, since: int = 0):
     """The task's events from `since`, as JSON (the page polls about once a second)."""
-    client = _nori_client(request)
-    return _nori_proxy(lambda: client.aspire_task_events(task_id, since))
+    client, worker_id = _aspire_task_client(request, task_id)
+
+    def read_events(cursor):
+        return _nori_proxy(lambda: client.aspire_task_events(worker_id, cursor))
+
+    page = read_events(since)
+    save_kept_timelines(task_id, page, read_events, dataset_browser._lerobot_cache_root() / "agent_episodes")
+    return page
 
 
 @app.post("/nori/aspire/tasks/{task_id}/answer")
 def nori_aspire_answer(task_id: str, body: NoriAspireTextBody, request: Request):
-    client = _nori_client(request)
+    client, task_id = _aspire_task_client(request, task_id)
     return _nori_proxy(lambda: client.aspire_answer(task_id, body.text))
 
 
 @app.post("/nori/aspire/tasks/{task_id}/comment", status_code=202)
 def nori_aspire_comment(task_id: str, body: NoriAspireTextBody, request: Request):
-    client = _nori_client(request)
+    client, task_id = _aspire_task_client(request, task_id)
     return _nori_proxy(lambda: client.aspire_comment(task_id, body.text))
 
 
 @app.post("/nori/aspire/tasks/{task_id}/cancel", status_code=202)
 def nori_aspire_cancel(task_id: str, body: NoriAspireCancelBody, request: Request):
     """Stop: the executor zeroes motion and E-STOPs the robot before the task ends."""
-    client = _nori_client(request)
+    client, task_id = _aspire_task_client(request, task_id)
     return _nori_proxy(lambda: client.aspire_cancel(task_id, body.reason))
 
 
 @app.post("/nori/aspire/tasks/{task_id}/presence")
 def nori_aspire_presence(task_id: str, request: Request):
-    client = _nori_client(request)
+    client, task_id = _aspire_task_client(request, task_id)
     return _nori_proxy(lambda: client.aspire_presence(task_id))
 
 
@@ -2056,13 +2091,13 @@ class NoriAspireEntryActionBody(BaseModel):
 @app.get("/nori/aspire/robots/{robot}/notes")
 def nori_aspire_robot_notes(robot: str, request: Request):
     """The agent's memory for a robot (the Agent page's card under the transcript)."""
-    client = _nori_client(request)
+    client = _aspire_client(request)
     return _nori_proxy(lambda: client.aspire_robot_notes(robot))
 
 
 @app.post("/nori/aspire/robots/{robot}/notes/entries/{topic}/{title}")
 def nori_aspire_note_action(robot: str, topic: str, title: str, body: NoriAspireEntryActionBody, request: Request):
-    client = _nori_client(request)
+    client = _aspire_client(request)
     return _nori_proxy(lambda: client.aspire_note_action(robot, topic, title, body.model_dump(exclude_none=True)))
 
 

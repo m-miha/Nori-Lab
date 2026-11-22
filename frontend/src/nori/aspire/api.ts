@@ -59,7 +59,42 @@ export interface NoteFile {
   updated_at?: string | null;
 }
 
+interface TransferEvidence {
+  before: string;
+  after: string;
+  step: number;
+}
+
+interface RecoveryExample {
+  task: string;
+  evidence: string;
+  failed_step: number;
+  correction_step: number;
+  evidence_step: number;
+  variation?: TransferEvidence | null;
+}
+
+export interface RecoverySkill {
+  id: string;
+  title: string;
+  trigger: string;
+  correction: string;
+  limits?: string;
+  check?: string;
+  transfer_test?: string;
+  scene?: string;
+  examples?: RecoveryExample[];
+  evidence: string;
+  instruction: string;
+  task: string;
+  failed_step: number;
+  correction_step: number;
+  evidence_step: number;
+  verification: { task: string; evidence: string; evidence_step: number; variation?: TransferEvidence | null } | null;
+}
+
 export interface RobotNotes {
+  experiment?: { folder: string; skills: RecoverySkill[] };
   robot: string;
   files: NoteFile[];
   promotable: { topic: string; title: string; useful_runs: string[] }[];

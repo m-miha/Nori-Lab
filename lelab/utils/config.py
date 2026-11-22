@@ -74,7 +74,11 @@ except ImportError:  # python-dotenv is optional; env vars still work without it
 #
 # Local-dev note: LeLab's own uvicorn binds :8000, so Nori-Backend must run on a
 # different port locally. The default below assumes `uvicorn main:app --port 8001`.
-NORI_BACKEND_URL = os.environ.get("NORI_BACKEND_URL", "http://localhost:8001").rstrip("/")
+# Local skill trials run the Agent on the laptop and use the operator's hosted account and paired robots.
+_default_backend_url = (
+    "https://nori-backend-production.up.railway.app" if os.environ.get("NORI_LAB_SKILL_DIR") else "http://localhost:8001"
+)
+NORI_BACKEND_URL = os.environ.get("NORI_BACKEND_URL", _default_backend_url).rstrip("/")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 # The anon key is safe to ship to the browser (it only permits what Supabase RLS allows).
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
@@ -101,6 +105,7 @@ def nori_public_config() -> dict[str, str | bool]:
     """
     return {
         "noriBackendUrl": NORI_BACKEND_URL,
+        **({"localAgentStereoRobot": "NORI-A3-0003"} if os.environ.get("NORI_LAB_SKILL_DIR") else {}),
         "supabaseUrl": SUPABASE_URL,
         "supabaseAnonKey": SUPABASE_ANON_KEY,
         # Lets the frontend show a clear "Nori auth not configured" state instead of

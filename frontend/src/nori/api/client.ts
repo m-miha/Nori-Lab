@@ -46,6 +46,7 @@ export function isProvisioned(me: CustomerMe): me is CustomerProfile {
 }
 
 export interface NoriPublicConfig {
+  localAgentStereoRobot?: string;
   noriBackendUrl: string;
   supabaseUrl: string;
   supabaseAnonKey: string;

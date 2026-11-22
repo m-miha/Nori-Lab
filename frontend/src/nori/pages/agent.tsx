@@ -33,7 +33,9 @@ import {
 import { CONTINUE_S, DEPTH_MODELS, LLM_CALLS, SECONDS, loadGoal, saveGoal, SPEED, TABLE_Z, loadSettings, parseTableZ, saveSettings, taskFields, type AgentSettings, PRIMITIVES } from "@/nori/aspire/settings";
 import { TuneSlider } from "@/nori/remote/TuneSlider";
 import { useAgentTask } from "@/nori/aspire/AgentTaskContext";
+import type { RecoverySkill } from "@/nori/aspire/api";
 import { RobotMemory } from "@/nori/aspire/RobotMemory";
+import { agentPython } from "@/nori/aspire/agentPython";
 
 const EVENTS_MS = 1500;     // transcript poll
 const LOG_LINE_MAX = 240;   // a log line, however much the event carried
@@ -46,13 +48,14 @@ type Row =
   | { kind: "thought"; text: string }
   | { kind: "think"; text: string }
   | { kind: "say"; text: string }
-  | { kind: "call"; tool: string; args: Record<string, unknown>; pending: boolean; status?: string; result?: string }
+  | { kind: "call"; step?: number; tool: string; args: Record<string, unknown>; pending: boolean; status?: string; result?: string }
   | { kind: "frame"; tool: string; src: string }
   | { kind: "refused"; tool: string; reason: string }
   | { kind: "question"; text: string; answered?: string }
   | { kind: "comment"; text: string }
   | { kind: "safety"; text: string }
   | { kind: "verdict"; confidence: number | null; label: string; summary: string; goals: { goal: string; met: string; observed: string }[] }
+  | { kind: "recovery"; text: string; detail: string }
   | { kind: "learned"; text: string; titles: string[] }
   | { kind: "end"; status: TaskStatus; text: string };
 
@@ -60,6 +63,7 @@ type Row =
 // start_check/started/home/safety/record… — and that is exactly what the logs card shows: how the worker
 // got to the robot (claim → credentials → session → arming → table) and why it did not, when it did not.
 const TRANSCRIPT_TYPES = new Set([
+  "step_failure", "skill_trial", "skill_queued", "skill_supported", "skill_verified", "recovery_unconfirmed",
   "thought", "think", "say", "episode_started", "episode_done", "record_warning", "step_start", "step", "frame", "needs_input", "answered", "comment", "instruction_done", "waiting", "continued", "verdict", "advice", "done", "failed", "cancelled",
 ]);
 
@@ -135,6 +139,10 @@ export function toRows(instruction: string, events: TaskEvent[]): Row[] {
         rows.push({ kind: "info", text: `started on ${str(e.robot)} · model ${str(e.model)} · ${str(e.grant)} session` });
         if (e.settings) rows.push({ kind: "info", text: settingsLine(e.settings as Record<string, unknown>) });
         break;
+      case "table":
+        if (e.step === "measuring" && e.detail) rows.push({ kind: "info", text: str(e.detail) });
+        if (typeof e.z === "number" && e.kind === "table") rows.push({ kind: "info", text: `measured tabletop at ${e.z.toFixed(3)} m` });
+        break;
       case "home":
         rows.push({ kind: "info", text: e.ok ? `homed the ${str(e.side)} arm to the high-side pose (${str(e.duration_s)} s)`
           : `homing skipped: ${str(e.skipped ?? e.reason)}` });
@@ -173,9 +181,23 @@ export function toRows(instruction: string, events: TaskEvent[]): Row[] {
         break;
       }
       case "record_warning": rows.push({ kind: "safety", text: `recording problem (${str(e.kind)}): ${str(e.detail)}` }); break;
+      case "step_failure":
+        rows.push({ kind: "info", text: `Failed call #${e.failed_step} · observed at #${e.observed_step} · ${str(e.reason, 800)}` });
+        break;
+      case "skill_trial":
+        rows.push({ kind: "info", text: `Verification run for “${str(e.title)}”` });
+        break;
+      case "recovery_unconfirmed":
+        rows.push({ kind: "info", text: `Recovery unconfirmed for call #${e.failed_step} · ${str(e.reason, 800)}` });
+        break;
+      case "skill_queued": case "skill_supported": case "skill_verified":
+        rows.push({ kind: "recovery", text: `${{skill_queued: "Queued for verification", skill_supported: "Supporting recovery added", skill_verified: "Skill verified"}[e.type]} · ${str(e.title)}`,
+          detail: [`Failed #${e.failed_step} → correction #${e.correction_step} → checked #${e.evidence_step}`, str(e.correction, 800), str(e.evidence, 800),
+            e.type === "skill_supported" && e.transfer_trial && !e.variation ? "The recovery worked. A change from the original setup still needs verification." : ""].filter(Boolean).join("\n") });
+        break;
       case "step_start":
         pending.push(rows.length);
-        rows.push({ kind: "call", tool: str(e.tool), args: (e.args as Record<string, unknown>) ?? {}, pending: true });
+        rows.push({ kind: "call", tool: str(e.tool), args: (e.args as Record<string, unknown>) ?? {}, pending: true, ...(typeof e.lab_step === "number" ? { step: e.lab_step } : {}) });
         break;
       case "step": {
         const i = pending.shift();
@@ -236,11 +258,14 @@ const Agent = () => {
     teleop, running: appSessionUp, connecting: appSessionJoining, disconnect: closeAppSession,
     heldNote, clearEstopLatch,
   } = useTeleopSession();
-  const { activeRobotSerial, customer } = useNori();
+  const { activeRobotSerial, customer, config } = useNori();
   const { baseUrl, fetchWithHeaders } = useApi();
   const api = useMemo(() => aspireApi(baseUrl, fetchWithHeaders), [baseUrl, fetchWithHeaders]);
 
   const robot = activeRobotSerial ?? customer?.robot_serial_number ?? "";
+  const stereoOnly = config?.localAgentStereoRobot === robot.toUpperCase();
+  const [trial, setTrial] = useState<{robot: string; skill: RecoverySkill} | null>(null);
+  const selected = trial?.robot === robot ? trial.skill : null;
   const [goal, setGoal] = useState(loadGoal);
   useEffect(() => { saveGoal(goal); }, [goal]);
   const [settings, setSettings] = useState<AgentSettings>(loadSettings);
@@ -275,7 +300,8 @@ const Agent = () => {
   const active = !!taskId && status !== null && !TERMINAL.has(status);
   const ended = status !== null && TERMINAL.has(status);
   const rows = useMemo(() => toRows(record?.instruction ?? goal, events), [record?.instruction, goal, events]);
-  const memoryRefresh = useMemo(() => events.filter((e) => e.type === "advice").length, [events]);
+  const python = useMemo(() => agentPython(events), [events]);
+  const memoryRefresh = useMemo(() => events.filter((e) => ["advice", "skill_queued", "skill_supported", "skill_verified"].includes(e.type)).length, [events]);
   const openQuestion = record?.waiting_for_answer && rows.some((r) => r.kind === "question" && !r.answered);
   const queuedComments = useMemo(() => pendingComments(sentComments, events), [sentComments, events]);
   const waitingNext = active && record?.waiting_for_instruction === true;
@@ -299,6 +325,7 @@ const Agent = () => {
     // same cursor, so the opening events (queued, claimed) arrived twice. The cursor advances only when a fetch returns,
     // and the merge drops anything at or below the last `n` already shown as a second guard.
     let inflight = false;
+    let finalRead: ReturnType<typeof setTimeout>;
     const tick = async () => {
       if (stop || inflight) return;
       inflight = true;
@@ -310,8 +337,16 @@ const Agent = () => {
             const last = prev.length ? prev[prev.length - 1].n : -1;
             return [...prev, ...evs.filter((e) => e.n > last)];
           });
+          // A reattached tab can be several pages behind when the task ends.
+          // Drain the remaining events so every kept recording reaches the local collector.
+          if (ended) finalRead = setTimeout(tick, 0);
         }
-      } catch (e) { setError(friendlyErrorMessage(e)); }
+      } catch (e) {
+        if (!stop) {
+          setError(friendlyErrorMessage(e));
+          if (ended) finalRead = setTimeout(tick, EVENTS_MS);
+        }
+      }
       finally { inflight = false; }
     };
     const rec = async () => {
@@ -319,7 +354,7 @@ const Agent = () => {
       try { const r = await api.task(taskId); if (!stop) setRecord(r); } catch (e) { setError(friendlyErrorMessage(e)); }
     };
     void tick(); void rec();
-    if (ended) return () => { stop = true; };               // one last read for the final events, then nothing changes
+    if (ended) return () => { stop = true; clearTimeout(finalRead); };
     const a = setInterval(tick, EVENTS_MS), b = setInterval(rec, RECORD_MS);
     return () => { stop = true; clearInterval(a); clearInterval(b); };
   }, [api, taskId, ended]);
@@ -361,11 +396,13 @@ const Agent = () => {
     try {
       await yieldRobot();
       const fields = taskFields(settings);
+      if (stereoOnly) delete fields.constraints.depth_model;
       const r = await api.start({
         robot, instruction: goal.trim(), budget: fields.budget,
-        constraints: fields.constraints,
+        constraints: selected ? { ...fields.constraints, verify_skill: selected.id, learn: true } : fields.constraints,
         caller: { kind: "lab_agent_page" },
       });
+      setTrial(null);
       attach(r.task_id);
     } catch (e) {
       note(`start failed: ${friendlyErrorMessage(e)}`);
@@ -447,6 +484,10 @@ const Agent = () => {
           <div className="flex min-w-0 flex-col gap-4">
             <div className="flex shrink-0 flex-col gap-2 rounded-md border border-nori-h14131a/10 bg-nori-hf6f4eb p-4 text-nori-h14131a shadow-sm">
               <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-nori-hb06a1c">// goal</span>
+              {selected && <div className="flex items-center justify-between text-xs">
+                <div>Verification run · {selected.title}<p>{selected.transfer_test ?? "Change the object, placement or scene and check that the recovery still works."}</p></div>
+                <Button size="sm" variant="ghost" onClick={() => setTrial(null)}>Clear selection</Button>
+              </div>}
               <Textarea
                 value={goal}
                 onChange={(e) => setGoal(e.target.value)}
@@ -461,9 +502,9 @@ const Agent = () => {
                     title="How fast the robot moves, as a share of its full rate. A jog covers the same distance at any speed; contact is harder at higher speed."
                     onChange={(v) => tune({ speed: v })} />
                   <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                    <label className="flex items-center gap-1.5" title="The table's height in metres. It is the hand's safety floor, and depth is anchored to it. Empty uses the robot's configured height.">
+                    <label className="flex items-center gap-1.5" title={stereoOnly ? "Leave blank to measure the tabletop from stereo before homing. A typed height sets the hand safety floor." : "The table's height in metres. It is the hand's safety floor, and depth is anchored to it. Empty uses the robot's configured height."}>
                       table height (m)
-                      <input type="number" step={0.01} min={TABLE_Z.min} max={TABLE_Z.max} value={settings.tableZ} placeholder="robot default"
+                      <input type="number" step={0.01} min={TABLE_Z.min} max={TABLE_Z.max} value={settings.tableZ} placeholder={stereoOnly ? "from stereo" : "robot default"}
                         onChange={(e) => tune({ tableZ: e.target.value })}
                         className={`w-24 rounded border bg-transparent px-1 py-0.5 ${badTable ? "border-red-500" : "border-nori-h14131a/20"}`} />
                     </label>
@@ -479,9 +520,9 @@ const Agent = () => {
                     </label>
                     <label className="flex items-center gap-1.5" title="Which depth model the agent's views use">
                       depth
-                      <select value={settings.depthModel} onChange={(e) => tune({ depthModel: e.target.value })} className="rounded border border-nori-h14131a/20 bg-transparent px-1 py-0.5">
+                      {stereoOnly ? <span>stereo triangulation · front + overhead</span> : <select value={settings.depthModel} onChange={(e) => tune({ depthModel: e.target.value })} className="rounded border border-nori-h14131a/20 bg-transparent px-1 py-0.5">
                         {DEPTH_MODELS.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
-                      </select>
+                      </select>}
                     </label>
                     <label className="flex items-center gap-1.5" title="Which primitive set the agent gets. new: the target-based tools (move_to steers the hand to a point, locate_object, descend_until_contact, grasped, placed) next to the jog tools, with the position pick-and-place skill. old: the jog tools alone with the jog pick-and-place skill, as before 2026-11-06.">
                       primitives
@@ -519,8 +560,8 @@ const Agent = () => {
                         onChange={(e) => tune({ continueS: Math.max(CONTINUE_S.min, Math.min(CONTINUE_S.max, Number(e.target.value) || 0)) })}
                         className="w-14 rounded border border-nori-h14131a/12 bg-nori-hfffdf7 px-1 py-0.5" aria-label="Seconds to hold for the next instruction" /> s
                     </label>
-                    <label className="flex items-center gap-1.5" title="At the end of the run the agent writes what it learned into this robot's memory (the card under the transcript) and reads it before the next task. Off runs the task without writing anything.">
-                      <input type="checkbox" checked={settings.learn} onChange={(e) => tune({ learn: e.target.checked })} />
+                    <label className="flex items-center gap-1.5" title="Allow the agent to save what it learns during this task.">
+                      <input type="checkbox" checked={!!selected || settings.learn} disabled={!!selected} onChange={(e) => tune({ learn: e.target.checked })} />
                       learn from this run
                     </label>
                   </div>
@@ -651,7 +692,18 @@ const Agent = () => {
                 <span className="font-mono text-muted-foreground">The agent's thoughts, what it says, its tool calls, their results and the frames it looked at appear here.</span>
               ) : groupRows(rows).map((g, i) => ("row" in g ? <TranscriptRow key={i} row={g.row} /> : <Folded key={i} group={g} />))}
             </div>
-            <RobotMemory api={api} robot={robot} refreshKey={memoryRefresh} />
+            {taskId && (
+              <details key={taskId} className="min-w-0 rounded-md border border-nori-h14131a/10 bg-nori-hf3f1e8 text-xs">
+                <summary className="cursor-pointer px-3 py-2 font-mono text-[11px] uppercase tracking-[0.18em] text-nori-hb06a1c">Python tool calls</summary>
+                <div className="space-y-2 border-t border-nori-h14131a/10 p-3">
+                  <a download={`agent-${taskId}.py`} href={`data:text/x-python;charset=utf-8,${encodeURIComponent(python)}`}
+                    className="font-mono text-[11px] text-nori-h4d6a1e underline">Download .py</a>
+                  <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-nori-h5a5346">{python}</pre>
+                </div>
+              </details>
+            )}
+            <RobotMemory key={robot} api={api} robot={robot} refreshKey={memoryRefresh} canSelect={!active && !busy}
+              onSelectTrial={(skill) => { setTrial({ robot, skill }); setGoal(skill.instruction); }} />
           </div>
         </div>
       </div>
@@ -697,7 +749,7 @@ const Folded = ({ group }: { group: Exclude<RowGroup, { row: Row }> }) => {
   const call = group.call; const n = group.thoughts.length;
   const ok = call?.status === "ok";
   const label = call
-    ? `${call.pending ? "… " : "→ "}${call.tool}(${compactArgs(call.args)})`
+    ? `${call.pending ? "… " : "→ "}${call.step !== undefined ? `#${call.step} ` : ""}${call.tool}(${compactArgs(call.args)})`
     : `thoughts (${n})`;
   const hasDetail = n > 0 || (!!call && !call.pending && !!call.result);
   return (
@@ -743,7 +795,7 @@ const TranscriptRow = ({ row }: { row: Row }) => {
       return (
         <div className="break-all font-mono text-[11px]">
           <div className={row.pending ? "text-nori-h857b6b" : "text-nori-h4d6a1e"}>
-            {row.pending ? "… " : "→ "}{row.tool}({compactArgs(row.args)})
+            {row.pending ? "… " : "→ "}{row.step !== undefined && `#${row.step} `}{row.tool}({compactArgs(row.args)})
           </div>
           {!row.pending && row.result && (
             <div className={"whitespace-pre-wrap pl-3 " + (ok ? "text-nori-h857b6b" : "text-nori-hb4442e")}>{ok ? "↳ " : "✗ "}{row.result}</div>
@@ -779,6 +831,10 @@ const TranscriptRow = ({ row }: { row: Row }) => {
         </div>
       );
     }
+    case "recovery":
+      return <div className="whitespace-pre-wrap break-words rounded border border-nori-h8ab135/40 px-2 py-1 text-xs">
+        <strong>{row.text}</strong><div>{row.detail}</div>
+      </div>;
     case "learned":
       return <div className="whitespace-pre-wrap break-words font-mono text-[11px] text-nori-h4d6a1e">✎ learned this run — {row.text}</div>;
     case "end":

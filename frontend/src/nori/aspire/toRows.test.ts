@@ -171,3 +171,20 @@ describe("groupRows", () => {
     expect((g[3] as { thoughts: unknown[] }).thoughts).toHaveLength(1);
   });
 });
+
+it("links a recovery to numbered robot calls and displays the skill transition", () => {
+  const details = { title: "Recenter", failed_step: 1, correction_step: 3, evidence_step: 5, correction: "Relocate", evidence: "Object rose" };
+  const events = [
+    ev(0, "step_start", { tool: "gripper", lab_step: 1 }),
+    ev(1, "step", { tool: "gripper", status: "ok" }),
+    ev(2, "step_failure", { failed_step: 1, observed_step: 2, reason: "Empty jaw" }),
+    ev(3, "skill_queued", details), ev(4, "skill_verified", details), ev(5, "skill_supported", details),
+  ];
+  const rows = toRows("Pick up the box", events);
+  expect(rows[1]).toMatchObject({ kind: "call", step: 1, pending: false });
+  expect(rows[2]).toMatchObject({ text: expect.stringContaining("Failed call #1") });
+  expect(rows[3]).toMatchObject({ kind: "recovery", text: "Queued for verification · Recenter", detail: expect.stringContaining("checked #5") });
+  expect(rows[4]).toMatchObject({ kind: "recovery", text: "Skill verified · Recenter" });
+  expect(rows[5]).toMatchObject({ kind: "recovery", text: "Supporting recovery added · Recenter" });
+  expect(toLogLines(events)).toEqual([]);
+});

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Start the Agent experiment and the local Lab UI together.
+set -eu
+hardware=0
+if [[ ${1:-} == --hardware ]]; then hardware=1; shift; fi
+if [[ $# != 1 ]]; then
+  echo "Usage: scripts/local-agent [--hardware] SKILL_FOLDER" >&2
+  exit 2
+fi
+export NORI_LAB_SKILL_DIR="$(realpath -m -- "$1")"
+root="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+policy="${NORI_POLICY_AGENT_DIR:-$root/../nori-policy-agent}"
+worker_python="${NORI_POLICY_PYTHON:-$policy/sim/.venv-mujoco/bin/python}"
+keys="${NORI_SDK_ENV:-$HOME/.config/nori/sdk.env}"
+if ! command -v npm >/dev/null; then
+  echo "Node and npm are required for the Lab dev UI. Activate your Node 22 environment first." >&2
+  exit 1
+fi
+runtime="$(mktemp -d)"
+export NORI_LAB_WORKER_CONNECTION="$runtime/worker.json"
+cd "$root"
+(
+  if [[ -f "$keys" ]]; then
+    set -a
+    source "$keys"
+    set +a
+  fi
+  # Only these public configuration values are needed by Lab and Vite.
+  printf '%s\n' "${NORI_SUPABASE_URL:-}" "${NORI_SUPABASE_ANON_KEY:-}" > "$runtime/signaling"
+  export ASPIRE_ALLOW_HARDWARE="$hardware" PYTHONPATH="$root:$policy:$policy/sim${PYTHONPATH:+:$PYTHONPATH}"
+  exec "$worker_python" -m lelab.local_skill_worker
+) &
+worker=$!
+cleanup() {
+  kill "$worker" 2>/dev/null || true
+  wait "$worker" 2>/dev/null || true
+  rm -f -- "$NORI_LAB_WORKER_CONNECTION" "$runtime/worker.tmp" "$runtime/signaling"
+  rmdir "$runtime"
+}
+trap cleanup EXIT
+for ((i=0; i<300; i++)); do
+  [[ -s "$NORI_LAB_WORKER_CONNECTION" ]] && break
+  kill -0 "$worker" 2>/dev/null || { wait "$worker"; exit 1; }
+  sleep .1
+done
+[[ -s "$NORI_LAB_WORKER_CONNECTION" ]] || { echo "Local worker startup timed out." >&2; exit 1; }
+echo "Local Agent skill library: $NORI_LAB_SKILL_DIR"
+{
+  read -r signaling_url
+  read -r signaling_key
+} < "$runtime/signaling"
+export SUPABASE_URL="${SUPABASE_URL:-$signaling_url}" SUPABASE_ANON_KEY="${SUPABASE_ANON_KEY:-$signaling_key}"
+PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" lelab --dev
